@@ -7,3 +7,5 @@ description: Minimal Skill used to verify XSL remote version and commit update d
 # XSL Skill Version Check Fixture
 
 Return exactly: `XSL skill fixture 1.0.6`.
+
+Another test starts now.
