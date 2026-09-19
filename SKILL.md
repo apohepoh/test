@@ -1,6 +1,6 @@
 ---
 name: xsl-version-check-fixture
-version: 1.0.6
+version: 1.0.92
 description: Minimal Skill used to verify XSL remote version and commit update detection.
 ---
 
