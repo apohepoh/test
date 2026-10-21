@@ -1,0 +1,45 @@
+name: Split Android tool caches
+on:
+  push:
+    branches: [chatgpt/androidfm-1.2-build-tools-20261022]
+    paths: [.github/workflows/androidfm-tool-parts.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  split:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-build-caches
+          path: /tmp/caches
+          github-token: ${{ github.token }}
+          repository: apohepoh/test
+          run-id: 39694232609
+      - name: Split without recompression
+        shell: bash
+        run: |
+          mkdir -p /tmp/parts
+          tar -C /tmp/caches -cf - . | split -b 450M -d - /tmp/parts/tool-caches.part-
+          sha256sum /tmp/parts/*
+          ls -lh /tmp/parts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-cache-part-00
+          path: /tmp/parts/tool-caches.part-00
+          compression-level: 0
+          retention-days: 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-cache-part-01
+          path: /tmp/parts/tool-caches.part-01
+          compression-level: 0
+          retention-days: 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-cache-part-02
+          path: /tmp/parts/tool-caches.part-02
+          compression-level: 0
+          retention-days: 2
