@@ -1,0 +1,57 @@
+name: AndroidFM public stream checks
+on:
+  push:
+    branches: [chatgpt/androidfm-1.2-build-tools-20261022]
+    paths: [.github/workflows/androidfm12-network-check.yml]
+permissions:
+  contents: read
+jobs:
+  network:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Check directory endpoints and media decoding samples
+        shell: bash
+        run: |
+          mkdir -p /tmp/network-report
+          python3 - <<'PY'
+          import requests,json,concurrent.futures,subprocess,shutil,datetime
+          headers={'User-Agent':'AndroidFM/1.2 build-validation'}
+          endpoints=[f'https://{host}.api.radio-browser.info/json/stations/bycountrycodeexact/DE?hidebroken=true&limit=3' for host in ['de1','nl1','at1']]
+          def check(url):
+              result={'url':url}
+              try:
+                  r=requests.get(url,headers=headers,timeout=12); result['http']=r.status_code
+                  if r.ok:
+                      records=r.json(); result['records']=len(records); result['stationNames']=[x.get('name') for x in records]
+                      result['sampleStreams']=[x.get('url_resolved') or x.get('url') for x in records]
+              except Exception as e: result['error']=type(e).__name__
+              return result
+          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex: directory=list(ex.map(check,endpoints))
+          streams=[]
+          samples=['https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8']
+          for result in directory:
+              if result.get('sampleStreams'): samples+=result['sampleStreams'][:2]; break
+          for url in samples:
+              if not url: continue
+              result={'url':url,'test':'FFprobe decoder probe, not an Android device test'}
+              if shutil.which('ffprobe'):
+                  try:
+                      p=subprocess.run(['ffprobe','-v','error','-analyzeduration','2000000','-probesize','128000','-show_entries','stream=codec_name,codec_type','-of','json',url],capture_output=True,text=True,timeout=20)
+                      result['exitCode']=p.returncode
+                      if p.returncode==0: result['streams']=json.loads(p.stdout).get('streams',[])
+                      else: result['error']=p.stderr[-600:]
+                  except Exception as e: result['error']=type(e).__name__
+              else: result['error']='ffprobe not installed'
+              streams.append(result)
+          report={'checkedAtUtc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'directory':directory,'mediaSamples':streams,'allStationsVerified':False,'androidPlaybackVerified':False}
+          text=json.dumps(report,indent=2,ensure_ascii=False)
+          open('/tmp/network-report/network-check.json','w').write(text)
+          print(text)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: androidfm-network-check
+          path: /tmp/network-report
+          retention-days: 7
