@@ -1,0 +1,74 @@
+name: AndroidFM bounded compile checks
+on:
+  push:
+    branches: [chatgpt/androidfm-1.2-build-tools-20261022]
+    paths: [.github/workflows/androidfm12-compile-check.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-build-caches
+          path: /tmp/caches
+          github-token: ${{ github.token }}
+          repository: apohepoh/test
+          run-id: 39694232609
+      - name: Restore dependencies and application
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle" "$HOME/.m2" /tmp/diagnostics
+          tar -xzf /tmp/caches/gradle-caches.tgz -C "$HOME/.gradle"
+          tar -xzf /tmp/caches/robolectric-platforms.tgz -C "$HOME/.m2"
+          python3 -m pip -q install gdown==5.2.0
+          sudo mkdir -p /mnt/data/androidfm12; sudo chown -R "$USER" /mnt/data
+          python3 - <<'PY'
+          import gdown,zipfile,subprocess,os
+          from pathlib import Path
+          p=Path('/mnt/data/androidfm12/AndroidFm')
+          def get(fid,path):
+              if not gdown.download(id=fid,output=str(path),quiet=True): raise RuntimeError('Input unavailable')
+          get('1yd0GccLle6LhBgInPJtcCzebCZ55U3cp','/tmp/source.zip')
+          with zipfile.ZipFile('/tmp/source.zip') as z: z.extractall(p.parent)
+          get('1ZabYC5Hbi7j6YF01DkXJmIzDd1rjFOM4','/tmp/patch.py'); subprocess.run(['python3','/tmp/patch.py'],check=True)
+          for fid,rel in [('1UEhLOhjBZ6AjdLTU4NrDTf4-sQZjq_Z2','app/src/main/java/pl/mmich/androidfm/RadioApplication.kt'),('1xWWywh2JQ8OXJFPL6BPp_xfQI2ibiNiv','app/src/test/java/pl/mmich/androidfm/StreamingRepositoryTest.kt'),('1kvwns-5vIEp6We6Vj0PwAGYczHGTYLHE','app/src/test/java/pl/mmich/androidfm/UiSmokeTest.kt')]: get(fid,p/rel)
+          f=p/'app/src/main/AndroidManifest.xml'; s=f.read_text()
+          if 'android:name=".RadioApplication"' not in s: f.write_text(s.replace('<application','<application android:name=".RadioApplication"',1))
+          (p/'local.properties').write_text('sdk.dir='+os.environ['ANDROID_HOME']+'\n')
+          with (p/'gradle.properties').open('a') as o: o.write('\norg.gradle.workers.max=2\nkotlin.compiler.execution.strategy=in-process\n')
+          (p/'gradlew').chmod(0o755)
+          PY
+      - name: Compile main and test code
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          cd /mnt/data/androidfm12/AndroidFm
+          ./gradlew --no-daemon --max-workers=2 :app:compileDebugKotlin :app:compileDebugUnitTestKotlin 2>&1 | tee /tmp/diagnostics/compiler.log
+      - name: Run bounded tests
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          cd /mnt/data/androidfm12/AndroidFm
+          timeout 240 ./gradlew --no-daemon --max-workers=2 :app:testDebugUnitTest 2>&1 | tee /tmp/diagnostics/tests.log
+      - name: Collect precise failures
+        if: always()
+        shell: bash
+        run: |
+          p=/mnt/data/androidfm12/AndroidFm
+          if [ -d "$p/app/build/test-results" ]; then cp -r "$p/app/build/test-results" /tmp/diagnostics/; fi
+          if [ -d "$p/app/build/reports" ]; then cp -r "$p/app/build/reports" /tmp/diagnostics/; fi
+          grep -nE '(^e:|error:|FAILED|Exception|FAILURE|What went wrong)' /tmp/diagnostics/*.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: androidfm-compile-diagnostics
+          path: /tmp/diagnostics
+          retention-days: 7
