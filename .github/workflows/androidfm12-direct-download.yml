@@ -1,0 +1,61 @@
+name: AndroidFM direct install downloads
+on:
+  push:
+    branches: [chatgpt/androidfm12-isolated-build-20261022]
+    paths: [.github/workflows/androidfm12-direct-download.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  direct:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 24
+    steps:
+      - name: Prepare verified delivery documents and unchanged installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import requests,os,base64,yaml,subprocess
+          from pathlib import Path
+          url='https://api.github.com/repos/apohepoh/RTS/contents/.github/workflows/androidfm12-delivery.yml?ref=fddf67b2957e94f5cc858c93b5181889e07f0071'
+          r=requests.get(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']},timeout=20);r.raise_for_status()
+          workflow=yaml.safe_load(base64.b64decode(r.json()['content']))
+          script=next(s['run'] for s in workflow['jobs']['package']['steps'] if 'run' in s)
+          Path('/tmp/verified-delivery.sh').write_text(script)
+          subprocess.run(['bash','/tmp/verified-delivery.sh'],check=True)
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/install/AndroidFM-1.2-staly-podpis.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/developer/AndroidFM-1.2-zrodla.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/developer/RAPORT-WYDANIA-1.2.md
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/developer/validation-1.2.json
+          archive: false
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/developer/android12-emulator/hls-video-android12.png
+          archive: false
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/developer/android12-emulator/streaming-persisted-android12.png
+          archive: false
+          retention-days: 30

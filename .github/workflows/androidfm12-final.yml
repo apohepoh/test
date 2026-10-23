@@ -1,0 +1,193 @@
+name: AndroidFM final signed installer
+on:
+  push:
+    branches: [chatgpt/androidfm12-isolated-build-20261022]
+    paths: [.github/workflows/androidfm12-final.yml]
+permissions:
+  contents: read
+  actions: read
+  issues: write
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@v8
+        with:
+          name: android-build-caches
+          path: /tmp/caches
+          github-token: ${{ github.token }}
+          repository: apohepoh/test
+          run-id: 39694232609
+      - name: Restore pinned and tested build stages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,requests,base64,yaml,subprocess
+          Path('/tmp/final-stages').mkdir()
+          url='https://api.github.com/repos/apohepoh/RTS/contents/.github/workflows/androidfm12-isolated.yml?ref=8f275c98291f9cfdd1249f0700764694fad97dfa'
+          r=requests.get(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']},timeout=20);r.raise_for_status()
+          old=yaml.safe_load(base64.b64decode(r.json()['content']))
+          names={'Restore reviewed build stages and dependencies':'bootstrap','Unit and persistence checks':'unit','Build optimized installer and run lint':'build','Prepare deterministic HLS and emulator test':'emulator','Package installer and matching sources':'package','Preserve diagnostics':'diagnostics'}
+          for step in old['jobs']['build']['steps']:
+              if step.get('name') in names: Path('/tmp/final-stages/'+names[step['name']]+'.sh').write_text(step['run'])
+          subprocess.run(['bash','-e','-o','pipefail','/tmp/final-stages/bootstrap.sh'],check=True)
+          PY
+      - name: Execute all unit checks and produce optimized APK
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          bash -e -o pipefail /tmp/final-stages/unit.sh
+          bash -e -o pipefail /tmp/final-stages/build.sh
+          mkdir -p /tmp/build-snapshot
+          cp /mnt/data/androidfm12/AndroidFm/app/build/outputs/apk/repair/app-repair.apk /tmp/build-snapshot/
+          cp -r /mnt/data/androidfm12/AndroidFm/app/build/test-results /tmp/build-snapshot/
+          cp /mnt/data/androidfm12/AndroidFm/app/build/outputs/mapping/repair/mapping.txt /tmp/build-snapshot/r8-mapping-1.2.txt
+          tar --exclude=build --exclude=.gradle --exclude=local.properties -C /mnt/data/androidfm12 -czf /tmp/build-snapshot/matching-sources.tgz AndroidFm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AndroidFM-1.2-build-snapshot
+          path: /tmp/build-snapshot
+          retention-days: 7
+      - name: Sign and verify permanent certificate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          bash /tmp/android-stages/sign.sh
+          bash /tmp/android-stages/package.sh
+          cp /tmp/build-snapshot/r8-mapping-1.2.txt /tmp/androidfm-dist/r8-mapping-1.2.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/androidfm-dist/AndroidFM-1.2-staly-podpis.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+      - name: Prepare HLS fixture and reclaim temporary build disk
+        shell: bash
+        run: |
+          bash -e -o pipefail /tmp/final-stages/emulator.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/verify-emulator.py');s=p.read_text()
+          s=s.replace('/mnt/data/androidfm12/AndroidFm/app/build/outputs/apk/repair/app-repair.apk','/tmp/androidfm-dist/AndroidFM-1.2-staly-podpis.apk')
+          s=s.replace("    adb('shell','input','keyevent','4');time.sleep(0.5)","    ime=adb('shell','dumpsys','input_method')\n    if 'mInputShown=true' in ime or 'mIsInputViewShown=true' in ime:\n        adb('shell','input','keyevent','4');time.sleep(0.5)")
+          p.write_text(s)
+          PY
+          rm -rf /tmp/caches "$HOME/.gradle/caches" "$HOME/.m2/repository/org/robolectric"
+          sudo rm -rf "$ANDROID_HOME/ndk" "$ANDROID_HOME/cmake"
+          df -h /
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Validate signed installer on Android 12
+        uses: reactivecircus/android-emulator-runner@v2
+        timeout-minutes: 8
+        with:
+          api-level: 31
+          target: default
+          arch: x86_64
+          profile: pixel_2
+          disk-size: 2048M
+          emulator-boot-timeout: 180
+          disable-animations: true
+          emulator-options: -no-window -no-snapshot -gpu software -noaudio -no-boot-anim -camera-back none -memory 2048 -partition-size 2048
+          script: python3 /tmp/verify-emulator.py
+      - name: Create matching release documentation and source archive
+        shell: bash
+        run: |
+          bash /tmp/final-stages/package.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,zipfile,shutil,hashlib
+          out=Path('/tmp/androidfm-dist');d=json.loads((out/'validation-1.2.json').read_text())
+          tests=sum(int(t['tests']) for t in d['tests']);failures=sum(int(t.get('failures') or 0)+int(t.get('errors') or 0) for t in d['tests'])
+          assert tests==31 and failures==0
+          assert d['android12Emulator']['installation'] and d['android12Emulator']['hlsAudioVideoFixturePlaying']
+          guide=f'''# Android FM 1.2 — gotowy instalator
+
+          ## Instalacja
+          Otwórz na telefonie plik `AndroidFM-1.2-staly-podpis.apk` i potwierdź instalację. Nie wymaga Android Studio ani kompilacji. Wymagany Android 8.0 lub nowszy.
+
+          Jeżeli Android poprosi, zezwól używanemu menedżerowi plików lub przeglądarce na instalację z tego źródła. Po instalacji można to uprawnienie wyłączyć.
+
+          ## Aktualizacja 1.1 bez odinstalowania
+          Ten APK ma ten sam certyfikat i identyfikator co `AndroidFM-1.1-staly-podpis.apk`. Numer wersji instalacyjnej podniesiono z 2 do 3. Nie odinstalowuj stabilnej 1.1 przed aktualizacją.
+          Wcześniejsza paczka z tymczasowym lub innym kluczem nie może zostać nadpisana tym instalatorem. W razie konfliktu podpisu nie usuwaj aplikacji bez zabezpieczenia ulubionych i własnych stacji — odinstalowanie usuwa lokalne dane.
+
+          ## Funkcje
+          - Zakładka Streaming: zapis własnych kanałów audio/wideo, wyszukiwanie, zmiana typu i usuwanie.
+          - HLS M3U8 pojedynczego kanału; import zwykłych playlist M3U oraz UTF-8 M3U8 z adresu lub pliku.
+          - Zachowany katalog 781 polskich stacji oraz dotychczasowe logotypy. Dodano współdzieloną pamięć podręczną logotypów i obsługę SVG.
+          - Wybór 38 krajów europejskich, w tym Polski. Stacje zagraniczne pobierane na żądanie, do 100 na kraj; nie dodano tysięcy stacji na stałe.
+          - Motyw jasny, ciemny i systemowy oraz tryb oszczędny. W trybie oszczędnym internetowe logotypy nie są pobierane.
+
+          ## Weryfikacja tego wydania
+          Kompilacja zoptymalizowanego APK i Android lint: powodzenie.
+          Testy JVM/Robolectric: {tests}, błędy: {failures}.
+          Emulator Android 12 (API 31): zainstalowano TEN podpisany APK, uruchomiono aplikację, wpisano i zapisano kanał przez formularz Streaming, uruchomiono kontrolny HLS z audio i wideo, sprawdzono zachowanie kanału po zatrzymaniu i ponownym uruchomieniu procesu. Wyniki oraz zrzuty ekranu pochodzą z emulatora, nie z fizycznego telefonu.
+          Zweryfikowano podpis APK i jego zgodność z certyfikatem wersji 1.1 oraz wyrównanie instalatora.
+
+          ## Ograniczenia
+          Nie wykonano testów na fizycznym telefonie użytkownika ani testu aktualizacji 1.1→1.2 na takim telefonie. Zgodność aktualizacji sprawdzono na podstawie identyfikatora, numeru wersji i certyfikatu.
+          Kontrolny HLS nie jest testem wszystkich internetowych stacji. Dostępność transmisji zależy od nadawcy, regionu i sieci. Nie wdrożono omijania DRM, płatnego dostępu lub geoblokad.
+
+          ## Identyfikacja
+          Wersja: 1.2; applicationId: `pl.mmich.androidfm.repaired`; versionCode: 3.
+          Rozmiar APK: {d['apkBytes']} bajtów.
+          SHA-256 APK: `{d['apkSha256']}`.
+          SHA-256 certyfikatu: `{d['certificateSha256']}`.
+          Klucz prywatny i hasło NIE są dołączone do instalatora ani źródeł.
+          '''
+          guide='\n'.join(line[10:] if line.startswith('          ') else line for line in guide.splitlines())+'\n'
+          (out/'RAPORT-WYDANIA-1.2.md').write_text(guide)
+          (out/'INSTALACJA.txt').write_text(guide)
+          source=out/'AndroidFM-1.2-zrodla.zip';temp=out/'source-updated.zip'
+          with zipfile.ZipFile(source) as original,zipfile.ZipFile(temp,'w',zipfile.ZIP_DEFLATED) as z:
+              for name in original.namelist():
+                  if name=='AndroidFm/README.md':z.writestr('AndroidFm/reports/README-historyczny-1.1.md',original.read(name))
+                  else:z.writestr(name,original.read(name))
+              z.writestr('AndroidFm/README.md',guide)
+              z.writestr('AndroidFm/reports/validation-1.2.json',json.dumps(d,indent=2))
+              z.write(out/'r8-mapping-1.2.txt','AndroidFm/reports/r8-mapping-1.2.txt')
+          temp.replace(source)
+          print(json.dumps(d,indent=2))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/androidfm-dist/AndroidFM-1.2-zrodla.zip
+          archive: false
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/androidfm-dist/RAPORT-WYDANIA-1.2.md
+          archive: false
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/androidfm-dist/validation-1.2.json
+          archive: false
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          path: /tmp/androidfm-dist/android12-emulator/hls-video-android12.png
+          archive: false
+          retention-days: 30
+      - name: Preserve diagnostics on any failure
+        if: always()
+        shell: bash
+        run: bash /tmp/final-stages/diagnostics.sh
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: androidfm12-final-diagnostics
+          path: /tmp/androidfm-diagnostics
+          retention-days: 7

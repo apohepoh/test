@@ -1,0 +1,113 @@
+name: AndroidFM delivery packages
+on:
+  push:
+    branches: [chatgpt/androidfm12-isolated-build-20261022]
+    paths: [.github/workflows/androidfm12-delivery.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 24
+    steps:
+      - name: Obtain verified release, without rebuilding or changing APK bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,requests,time,json,zipfile,io,hashlib,shutil,datetime
+          from pathlib import Path
+          repo='apohepoh/RTS';run_id=39699179350
+          session=requests.Session();session.headers.update({'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+          api=f'https://api.github.com/repos/{repo}'
+          for _ in range(130):
+              r=session.get(f'{api}/actions/runs/{run_id}',timeout=20);r.raise_for_status();run=r.json()
+              if run['status']=='completed':
+                  if run.get('conclusion')!='success':raise RuntimeError('Release build did not pass: '+str(run.get('conclusion')))
+                  break
+              time.sleep(10)
+          else:raise RuntimeError('Build completion not observed within package deadline')
+          r=session.get(f'{api}/actions/runs/{run_id}/artifacts',timeout=20);r.raise_for_status()
+          artifact=next(x for x in r.json()['artifacts'] if x['name']=='AndroidFM-1.2-instalator')
+          r=session.get(artifact['archive_download_url'],timeout=90);r.raise_for_status()
+          base=Path('/tmp/release');base.mkdir()
+          with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+              for n in z.namelist():
+                  if not (base/n).resolve().is_relative_to(base):raise RuntimeError('Unsafe archive path')
+              z.extractall(base)
+          validation=json.loads((base/'validation-1.2.json').read_text())
+          apk=base/'AndroidFM-1.2-staly-podpis.apk'; digest=hashlib.sha256(apk.read_bytes()).hexdigest()
+          assert digest==validation['apkSha256']
+          assert validation['certificateSha256']=='649faacab91c4ad6fd5af8a4d5c57132ea3645ad47102cd501b445db165f4e47'
+          assert validation['applicationId']=='pl.mmich.androidfm.repaired' and validation['versionCode']==3
+          assert validation['android12Emulator']['installation'] and validation['android12Emulator']['hlsAudioVideoFixturePlaying']
+          tests=sum(int(t['tests']) for t in validation['tests']); failures=sum(int(t.get('failures') or 0)+int(t.get('errors') or 0) for t in validation['tests'])
+          assert tests>0 and failures==0
+          install=Path('/tmp/install');dev=Path('/tmp/developer');install.mkdir();dev.mkdir()
+          shutil.copy2(apk,install/apk.name)
+          guide='''# Android FM 1.2 — gotowy instalator
+
+          ## Instalacja na telefonie
+          1. Rozpakuj pobrany ZIP.
+          2. Otwórz `AndroidFM-1.2-staly-podpis.apk` na telefonie.
+          3. Jeżeli Android zapyta, zezwól menedżerowi plików/przeglądarce na instalację tej aplikacji i zatwierdź instalację.
+          4. Po instalacji uprawnienie do instalowania z tego źródła można ponownie wyłączyć.
+
+          Wymagany Android 8.0 (API 26) lub nowszy. To gotowy APK — nie wymaga Android Studio ani kompilacji przez użytkownika.
+
+          ## Aktualizacja wersji 1.1
+          Nie odinstalowuj stabilnie podpisanej wersji 1.1. Ten instalator ma ten sam identyfikator aplikacji i ten sam certyfikat co `AndroidFM-1.1-staly-podpis.apk`, a numer `versionCode` podniesiono z 2 do 3.
+          Wcześniejszy instalator z tymczasowym/innym podpisem nie może zostać nadpisany tym plikiem. W razie konfliktu podpisów nie kasuj aplikacji bez zapisania ulubionych i własnych stacji. Samo odinstalowanie usuwa lokalne dane.
+
+          ## Funkcje
+          - Radio z zachowaną dotychczasową polską bazą i logotypami.
+          - Zakładka Streaming: zapis własnych kanałów audio/wideo, wyszukiwanie, zmiana typu i usuwanie.
+          - HLS `.m3u8` dla jednego kanału; import zwykłych playlist M3U oraz UTF-8 M3U8 z URL/pliku, do 512 KiB i 250 pozycji.
+          - Wybór spośród 38 krajów Europy, w tym Polski. Zagraniczne stacje są pobierane na żądanie, do 100 na kraj; nie dodano tysięcy stacji na stałe.
+          - Motyw jasny, ciemny i systemowy; tryb oszczędny; pamięć podręczna logotypów z obsługą SVG.
+
+          ## Sprawdzenie wydania
+          Kompilacja zoptymalizowanego APK i Android lint zakończyły się powodzeniem.
+          Testy JVM/Robolectric: TEST_COUNT wykonanych, 0 błędów. Testy repozytorium kanałów obejmują API 26, 31 i 34; test interfejsu Robolectric działa na API 34.
+          Emulator Android 12 (API 31): instalacja i uruchomienie, wpisanie danych w formularzu Streaming, zapis kanału, odtwarzanie kontrolnej transmisji HLS zawierającej audio i wideo oraz zachowanie kanału po zatrzymaniu i ponownym uruchomieniu procesu.
+          Zweryfikowano podpis APK i zgodność certyfikatu z wersją 1.1. Nie przeprowadzono aktualizacji 1.1→1.2 na fizycznym telefonie.
+
+          ## Ograniczenia
+          Nie testowano na fizycznym telefonie użytkownika ani nie potwierdzono działania każdej stacji internetowej. Dostępność zależy od nadawcy, regionu i połączenia. Nie wdrożono omijania DRM, logowania ani geoblokad.
+          W trybie oszczędnym logotypy internetowe nie są pobierane; obraz zastępczy nie oznacza usunięcia stacji lub adresu logo.
+
+          ## Dane techniczne
+          Wersja: 1.2; identyfikator: `pl.mmich.androidfm.repaired`; versionCode: 3.
+          APK SHA-256: `APK_DIGEST`.
+          Certyfikat SHA-256: `649faacab91c4ad6fd5af8a4d5c57132ea3645ad47102cd501b445db165f4e47`.
+          Klucz prywatny i hasło nie są częścią instalatora ani paczki źródeł.
+          '''
+          import textwrap
+          guide='\n'.join(line[10:] if line.startswith('          ') else line for line in guide.splitlines())+'\n'
+          guide=guide.replace('TEST_COUNT',str(tests)).replace('APK_DIGEST',digest)
+          (install/'INSTALACJA-1.2.md').write_text(guide)
+          (install/'SHA256SUMS.txt').write_text(digest+'  '+apk.name+'\n')
+          (dev/'RAPORT-WYDANIA-1.2.md').write_text(guide)
+          shutil.copy2(base/'validation-1.2.json',dev/'validation-1.2.json')
+          shutil.copy2(base/'signature-verification.txt',dev/'signature-verification.txt')
+          shutil.copytree(base/'android12-emulator',dev/'android12-emulator')
+          with zipfile.ZipFile(base/'AndroidFM-1.2-zrodla.zip') as original, zipfile.ZipFile(dev/'AndroidFM-1.2-zrodla.zip','w',zipfile.ZIP_DEFLATED) as output:
+              for n in original.namelist():
+                  if n=='AndroidFm/README.md': output.writestr('AndroidFm/reports/README-historyczny-1.1.md',original.read(n))
+                  else:output.writestr(n,original.read(n))
+              output.writestr('AndroidFm/README.md',guide)
+              output.writestr('AndroidFm/reports/validation-1.2.json',json.dumps(validation,indent=2))
+          print(json.dumps({'tests':tests,'failures':failures,'apkBytes':apk.stat().st_size,'apkSha256':digest,'sourceRun':run_id,'android12Emulator':validation['android12Emulator']},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AndroidFM-1.2-INSTALACJA
+          path: /tmp/install
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AndroidFM-1.2-ZRODLA-RAPORT
+          path: /tmp/developer
+          retention-days: 30

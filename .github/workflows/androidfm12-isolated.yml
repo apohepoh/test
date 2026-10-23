@@ -1,0 +1,222 @@
+name: AndroidFM 1.2 isolated build
+on:
+  push:
+    branches: [chatgpt/androidfm12-isolated-build-20261022]
+    paths: [.github/workflows/androidfm12-isolated.yml]
+permissions:
+  contents: read
+  actions: read
+  issues: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-build-caches
+          path: /tmp/caches
+          github-token: ${{ github.token }}
+          repository: apohepoh/test
+          run-id: 39694232609
+      - name: Restore reviewed build stages and dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle" "$HOME/.m2" /tmp/android-stages
+          tar -xzf /tmp/caches/gradle-caches.tgz -C "$HOME/.gradle"
+          tar -xzf /tmp/caches/robolectric-platforms.tgz -C "$HOME/.m2"
+          python3 - <<'PY'
+          import os,requests,base64,yaml
+          from pathlib import Path
+          url='https://api.github.com/repos/apohepoh/RTS/contents/.github/workflows/androidfm12-isolated.yml?ref=b4d3ecb3315b1946fa13b0eb3ecc9facdd8a6097'
+          r=requests.get(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']},timeout=20); r.raise_for_status()
+          old=yaml.safe_load(base64.b64decode(r.json()['content']))
+          names={'Restore AndroidFM sources and reviewed patches':'restore','Sign with previously verified permanent certificate':'sign','Package verified output and updated sources':'package'}
+          for step in old['jobs']['build']['steps']:
+              if step.get('name') in names: Path('/tmp/android-stages/'+names[step['name']]+'.sh').write_text(step['run'])
+          PY
+          bash /tmp/android-stages/restore.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/mnt/data/androidfm12/AndroidFm')
+          f=p/'app/src/test/java/pl/mmich/androidfm/StreamingRepositoryTest.kt'
+          f.write_text(f.read_text().replace('`() = runBlocking {','`(): Unit = runBlocking {'))
+          f=p/'app/src/test/java/pl/mmich/androidfm/UiSmokeTest.kt'; s=f.read_text()
+          start=s.index('        compose.onNodeWithText("Dodaj kana\\u0142 audio / wideo").performClick()')
+          end=s.index('        awaitState { state -> state.streamChannels.any',start)
+          s=s[:start]+'''        // Actual dialog typing and HLS playback are covered by the Android 12 emulator test.
+                  // Robolectric native Dialog layout does not reach Espresso idle for this form.
+                  compose.runOnUiThread { model().addStream("Test HLS", "https://example.org/test.m3u8", pl.mmich.androidfm.data.StreamKind.VIDEO, null) }
+          '''+s[end:]
+          f.write_text(s)
+          # Keep visible version labels consistent; application ID and certificate are unchanged.
+          f=p/'app/build.gradle'; f.write_text(f.read_text().replace('Android FM 1.1','Android FM 1.2'))
+          print('Fixed JUnit void return; real-device-form coverage moved to emulator instead of simulating native Dialog idleness.')
+          PY
+      - name: Unit and persistence checks
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          cd /mnt/data/androidfm12/AndroidFm
+          timeout 330 ./gradlew --no-daemon --max-workers=2 :app:testDebugUnitTest 2>&1 | tee /tmp/androidfm-diagnostics/tests.log
+      - name: Build optimized installer and run lint
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          cd /mnt/data/androidfm12/AndroidFm
+          ./gradlew --no-daemon --max-workers=2 :app:assembleRepair :app:lintRepair 2>&1 | tee /tmp/androidfm-diagnostics/build.log
+      - name: Prepare deterministic HLS and emulator test
+        shell: bash
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y ffmpeg
+          mkdir -p /tmp/androidfm-media /tmp/androidfm-diagnostics/emulator
+          ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=size=160x90:rate=10 -f lavfi -i sine=frequency=440:sample_rate=44100 -t 60 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -c:a aac -b:a 48k -hls_time 4 -hls_list_size 0 /tmp/androidfm-media/live.m3u8
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('/tmp/verify-emulator.py').write_text(r'''
+          import subprocess,time,xml.etree.ElementTree as ET,re,json,threading,http.server,functools
+          from pathlib import Path
+          out=Path('/tmp/androidfm-diagnostics/emulator')
+          app='pl.mmich.androidfm.repaired'
+          handler=functools.partial(http.server.SimpleHTTPRequestHandler,directory='/tmp/androidfm-media')
+          server=http.server.ThreadingHTTPServer(('0.0.0.0',8765),handler)
+          threading.Thread(target=server.serve_forever,daemon=True).start()
+          def adb(*args,timeout=30):
+              return subprocess.check_output(['adb',*args],timeout=timeout).decode(errors='replace')
+          def dump():
+              for attempt in range(4):
+                  try:
+                      adb('shell','uiautomator','dump','/sdcard/androidfm-window.xml',timeout=15)
+                      text=adb('shell','cat','/sdcard/androidfm-window.xml')
+                      (out/'last-window.xml').write_text(text)
+                      return ET.fromstring(text)
+                  except Exception:
+                      if attempt==3: raise
+                      time.sleep(1)
+          def locate(label,bottom=False):
+              root=dump(); found=[]
+              for node in root.iter('node'):
+                  if node.get('text')==label or node.get('content-desc')==label:
+                      coords=list(map(int,re.findall(r'\d+',node.get('bounds',''))))
+                      if len(coords)==4 and coords[2]>coords[0] and coords[3]>coords[1]: found.append(coords)
+              if not found: raise AssertionError('UI control not found: '+label)
+              return sorted(found,key=lambda b:b[1],reverse=bottom)[0]
+          def tap(label,bottom=False):
+              x1,y1,x2,y2=locate(label,bottom)
+              adb('shell','input','tap',str((x1+x2)//2),str((y1+y2)//2));time.sleep(0.6)
+          def screenshot(name):
+              (out/name).write_bytes(subprocess.check_output(['adb','exec-out','screencap','-p'],timeout=15))
+          def launch():
+              adb('shell','am','start','-W','-n',app+'/pl.mmich.androidfm.MainActivity');time.sleep(3)
+          try:
+              adb('install','-r','/mnt/data/androidfm12/AndroidFm/app/build/outputs/apk/repair/app-repair.apk',timeout=90)
+              adb('logcat','-c');launch();screenshot('home-android12.png')
+              tap('Streaming',bottom=True);screenshot('streaming-empty-android12.png')
+              tap('Dodaj kanał audio / wideo')
+              tap('Nazwa kanału');adb('shell','input','text','TestHLS')
+              tap('Adres transmisji HTTP(S) / .m3u8');adb('shell','input','text','http://10.0.2.2:8765/live.m3u8')
+              adb('shell','input','keyevent','4');time.sleep(0.5)
+              screenshot('streaming-form-android12.png');tap('Zapisz');time.sleep(2)
+              # Scroll only if the newly saved row lies below the small-screen fold.
+              for attempt in range(4):
+                  try: tap('TestHLS');break
+                  except AssertionError:
+                      adb('shell','input','swipe','190','650','190','290','350');time.sleep(0.7)
+              else: raise AssertionError('Saved channel was not displayed')
+              playing=False
+              for _ in range(25):
+                  media=adb('shell','dumpsys','media_session')
+                  if app in media and re.search(r'state=PlaybackState\s*\{state=3[, ]',media): playing=True;break
+                  time.sleep(1)
+              (out/'media-session.txt').write_text(media)
+              if not playing: raise AssertionError('HLS fixture did not reach PLAYING state')
+              screenshot('hls-video-android12.png')
+              adb('shell','am','force-stop',app);launch();tap('Streaming',bottom=True)
+              persisted=False
+              for _ in range(4):
+                  try: locate('TestHLS');persisted=True;break
+                  except AssertionError: adb('shell','input','swipe','190','650','190','290','350');time.sleep(0.7)
+              if not persisted: raise AssertionError('Channel missing after process restart')
+              screenshot('streaming-persisted-android12.png')
+              crash=adb('logcat','-d','-s','AndroidRuntime:E')
+              (out/'android-runtime.txt').write_text(crash)
+              if 'FATAL EXCEPTION' in crash: raise AssertionError('AndroidRuntime fatal exception observed')
+              report={'androidApi':31,'installation':True,'coldLaunch':True,'streamFormEntry':True,'channelSaved':True,'hlsAudioVideoFixturePlaying':True,'channelSurvivesProcessRestart':True,'physicalPhone':False}
+              (out/'emulator-validation.json').write_text(json.dumps(report,indent=2))
+              print(json.dumps(report),flush=True)
+          finally:
+              try: (out/'logcat.txt').write_text(adb('logcat','-d','-t','500'))
+              except Exception: pass
+              server.shutdown()
+          ''')
+          PY
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install and exercise Android 12 APK
+        uses: reactivecircus/android-emulator-runner@v2
+        timeout-minutes: 10
+        with:
+          api-level: 31
+          target: default
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -memory 2048
+          script: python3 /tmp/verify-emulator.py
+      - name: Sign with permanent AndroidFM certificate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: bash /tmp/android-stages/sign.sh
+      - name: Package installer and matching sources
+        shell: bash
+        run: |
+          bash /tmp/android-stages/package.sh
+          python3 - <<'PY'
+          import json,shutil
+          from pathlib import Path
+          out=Path('/tmp/androidfm-dist'); evidence=Path('/tmp/androidfm-diagnostics/emulator/emulator-validation.json')
+          data=json.loads((out/'validation-1.2.json').read_text());data['android12Emulator']=json.loads(evidence.read_text())
+          (out/'validation-1.2.json').write_text(json.dumps(data,indent=2))
+          shutil.copytree('/tmp/androidfm-diagnostics/emulator',out/'android12-emulator',dirs_exist_ok=True)
+          print(json.dumps(data,indent=2))
+          PY
+      - name: Preserve diagnostics
+        if: always()
+        shell: bash
+        run: |
+          p=/mnt/data/androidfm12/AndroidFm
+          mkdir -p /tmp/androidfm-diagnostics
+          if [ -d "$p/app/build/reports" ]; then cp -r "$p/app/build/reports" /tmp/androidfm-diagnostics/; fi
+          if [ -d "$p/app/build/test-results" ]; then cp -r "$p/app/build/test-results" /tmp/androidfm-diagnostics/; fi
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          for f in Path('/tmp/androidfm-diagnostics').rglob('TEST-*.xml'):
+              r=ET.parse(f).getroot(); print('TEST SUMMARY',f.name,r.attrib)
+              for e in r.iter('failure'): print(e.attrib,(e.text or '')[:6000])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: androidfm12-diagnostics
+          path: /tmp/androidfm-diagnostics
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: AndroidFM-1.2-instalator
+          path: /tmp/androidfm-dist
+          retention-days: 30

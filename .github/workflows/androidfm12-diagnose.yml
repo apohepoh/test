@@ -1,0 +1,24 @@
+name: AndroidFM test diagnosis
+on:
+  push:
+    branches: [chatgpt/androidfm12-isolated-build-20261022]
+    paths: [.github/workflows/androidfm12-diagnose.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 4
+    steps:
+      - name: Read streaming dialog source
+        shell: bash
+        run: |
+          python3 -m pip -q install gdown==5.2.0
+          python3 - <<'PY'
+          import zipfile,gdown
+          gdown.download(id='1yd0GccLle6LhBgInPJtcCzebCZ55U3cp',output='/tmp/src.zip',quiet=True)
+          with zipfile.ZipFile('/tmp/src.zip') as z:
+              name='AndroidFm/app/src/main/java/pl/mmich/androidfm/ui/AppScreens.kt'
+              lines=z.read(name).decode().splitlines()
+              print('\n'.join(f'{i+1}: {l}' for i,l in enumerate(lines) if 790<=i<=1050))
+          PY
